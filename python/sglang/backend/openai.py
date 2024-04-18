@@ -45,7 +45,6 @@ class OpenAI(BaseBackend):
         self,
         model_name: str,
         is_chat_model: Optional[bool] = None,
-        is_speculative: Optional[bool] = None,
         chat_template: Optional[ChatTemplate] = None,
         is_azure: bool = False,
         *args,
@@ -82,7 +81,8 @@ class OpenAI(BaseBackend):
 
         self.chat_begin_str = self.chat_template.role_prefix_and_suffix["assistant"][0]
         
-        self.is_speculative = is_speculative if is_speculative else False
+        self.spec_kwargs = {}
+        self.spec_form = []
 
     def get_chat_template(self):
         return self.chat_template
@@ -91,19 +91,34 @@ class OpenAI(BaseBackend):
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
+        api_num_spec_tokens=None,
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                if not s.text_.endswith(self.chat_begin_str):
-                    if not self.is_speculative:
-                            raise RuntimeError(
+                if api_num_spec_tokens is None:
+                    if not s.text_.endswith(self.chat_begin_str):
+                        raise RuntimeError(
                             "This use case is not supported. "
                             "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
                         )
-                prompt = s.messages_
+                    prompt = s.messages_
+                else:
+                    params = sampling_params.to_openai_kwargs()
+                    for key, value in params.items():
+                        if key == "stop": continue
+                        if key not in self.spec_kwargs:
+                            self.spec_kwargs[key] = value
+                        else:
+                            assert value == self.spec_kwargs[key]
+                    self.spec_form.append(("", params["stop"]))
+                    return "", {}
             else:
                 prompt = s.text_
 
+            print("-" * 60, flush=True)
+            print(prompt, flush=True)
+            print("-" * 60, flush=True)
+            print("!!!!!!!!!!!!! openai generate !!!!!!!!!!!!!!!!!!")
             kwargs = sampling_params.to_openai_kwargs()
             comp = openai_completion(
                 client=self.client,
@@ -113,6 +128,7 @@ class OpenAI(BaseBackend):
                 **kwargs,
             )
         elif sampling_params.dtype in [str, "str", "string"]:
+            assert not self.is_chat_model, "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
@@ -125,6 +141,7 @@ class OpenAI(BaseBackend):
             )
             comp = '"' + comp + '"'
         elif sampling_params.dtype in [int, "int"]:
+            assert not self.is_chat_model, "constrained type not supported on chat model"
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
@@ -141,19 +158,48 @@ class OpenAI(BaseBackend):
 
         return comp, {}
 
+    def spec_fill(self, value: str):
+        assert self.is_chat_model
+        self.spec_form.append((value, None))
+
+    def role_end_generate(
+        self,
+        s: StreamExecutor,
+    ):
+        print("!!!!!!!!!!!!! openai role end generate !!!!!!!!!!!!!!!!!!")
+        if self.spec_form[0][0] != "ASSISTANT": return
+
+        while True:
+            comp = openai_completion(
+                client=self.client,
+                is_chat=self.is_chat_model,
+                model=self.model_name,
+                prompt=s.messages_,
+                **self.spec_kwargs,
+            )
+            break
+        # TODO pattern match and retry if failed
+        self.spec_form = []
+
+        s.text_ += comp
+
+        # s.variables[name] = comp
+        # s.meta_info[name] = meta_info
+        # s.variable_event[name].set()
+
     def generate_stream(
         self,
         s: StreamExecutor,
         sampling_params: SglSamplingParams,
     ):
+        print("!!!!!!!!!!!!! openai generate stream !!!!!!!!!!!!!!!!!!")
         if sampling_params.dtype is None:
             if self.is_chat_model:
                 if not s.text_.endswith(self.chat_begin_str):
-                    if not self.is_speculative:
-                        raise RuntimeError(
-                            "This use case is not supported. "
-                            "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
-                        )
+                    raise RuntimeError(
+                        "This use case is not supported. "
+                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                    )
                 prompt = s.messages_
             else:
                 prompt = s.text_
